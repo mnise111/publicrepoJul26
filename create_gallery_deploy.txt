@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+#===============================================================================
+# create-gallery-and-deploy.sh
+#
+# End-to-end server-side pipeline:
+#
+#   [page blob VHD] --(1) platform import--> [managed image]
+#                   --(2) gallery build----> [ACG image version]
+#                   --(3) deploy-----------> [ESA / SMA VM]
+#
+# Private-endpoint notes:
+#   * Step (1) is the ONLY step that touches the storage account's PUBLIC
+#     endpoint: the Azure Compute resource provider (not this VM) reads the
+#     blob, and platform RPs cannot use your private endpoint. This script
+#     opens public network access ONLY for that step, then re-disables it.
+#     Data remains protected by Entra ID auth throughout - only endpoint
+#     reachability is temporarily exposed.
+#   * Steps (2) and (3) are control-plane + platform-internal managed-disk
+#     operations; no storage endpoints are involved at all.
+#
+# Prereqs: az login (or 'az login --identity'), Contributor on RG + storage RG.
+#===============================================================================
+set -euo pipefail
+
+#=========================== EDIT THESE VARIABLES ==============================
+LOCATION="australiaeast"
+RG="cisco-email-rg"                       # RG for images, gallery, VMs
+
+# --- source storage (behind private endpoint) ---
+STORAGE_RG="storage-rg"
+STORAGE_ACCOUNT="mycompanystvhd"
+CONTAINER="cisco-vhds"
+ESA_VHD_BLOB="esa-c600v-16-0-0.vhd"       # ~500 GB
+SMA_VHD_BLOB="sma-m600v-16-0-0.vhd"       # ~1.5 TB
+MANAGE_FIREWALL="true"                    # "true" = script toggles public access
+                                          # "false" = you manage it yourself
+
+# --- appliance/image settings ---
+HYPERV_GEN="V2"                           # confirm V1 vs V2 with Cisco TAC
+IMAGE_VERSION="16.0.0"                    # gallery version (Major.Minor.Patch)
+
+# --- compute gallery ---
+GALLERY_NAME="CiscoEmailGallery"          # letters, digits, dots, underscores
+
+# --- existing network ---
+VNET_RG="network-rg"
+VNET_NAME="prod-vnet"
+SUBNET_NAME="cisco-mgmt-subnet"
+NSG_NAME=""                               # optional existing NSG in VNET_RG
+
+# --- VMs (Cisco guide: Standard_D8s_v3, 8 vCPU / 32 GB) ---
+VM_SIZE="Standard_D8s_v3"
+ESA_VM_NAME="cisco-esa-01"
+SMA_VM_NAME="cisco-sma-01"
+DUMMY_USER="dummyadmin"                   # ignored by AsyncOS (real: admin/ironport)
+DUMMY_PASS="Dummy@$(openssl rand -hex 6)!"
+#===============================================================================
+
+SCRIPT_START=$(date +%s)
+SUB_ID=$(az account show --query id -o tsv)
+echo "==> Script started at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+echo "==> Subscription: ${SUB_ID}"
+
+elapsed () { local S=$1; printf '%02dh:%02dm:%02ds' $((S/3600)) $(( (S%3600)/60 )) $((S%60)); }
+
+#-------------------------------------------------------------------------------
+# STEP 1: temporarily open the storage public endpoint for the platform import
+#-------------------------------------------------------------------------------
+close_firewall () {
+  if [[ "${MANAGE_FIREWALL}" == "true" ]]; then
+    echo "==> Re-disabling public network access on ${STORAGE_ACCOUNT}..."
+    az storage account update -g "${STORAGE_RG}" -n "${STORAGE_ACCOUNT}" \
+      --public-network-access Disabled -o none
+  fi
+}
+
+if [[ "${MANAGE_FIREWALL}" == "true" ]]; then
+  echo "==> Temporarily ENABLING public network access on ${STORAGE_ACCOUNT}"
+  echo "    (required only while the Compute RP imports the VHDs)"
+  az storage account update -g "${STORAGE_RG}" -n "${STORAGE_ACCOUNT}" \
+    --public-network-access Enabled -o none
+  # ensure we always lock the account back down, even on failure
+  trap close_firewall EXIT
+  echo "==> Waiting 60s for the network change to propagate..."
+  sleep 60
+fi
+
+#-------------------------------------------------------------------------------
+# STEP 2: import VHDs -> managed images (platform-side deep copy)
+#-------------------------------------------------------------------------------
+create_managed_image () {
+  local IMAGE_NAME="$1" VHD_BLOB="$2"
+  local VHD_URL="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${CONTAINER}/${VHD_BLOB}"
+  local T0=$(date +%s)
+  echo
+  echo "==> Importing ${VHD_URL}"
+  echo "    -> managed image '${IMAGE_NAME}' (this is a full platform-side copy;"
+  echo "       expect a long wait for large VHDs)..."
+  az image create \
+    --resource-group "${RG}" \
+    --name "${IMAGE_NAME}" \
+    --location "${LOCATION}" \
+    --os-type Linux \
+    --hyper-v-generation "${HYPERV_GEN}" \
+    --source "${VHD_URL}" -o none
+  echo "==> Image '${IMAGE_NAME}' created in $(elapsed $(( $(date +%s) - T0 )))"
+}
+
+create_managed_image "cisco-esa-image" "${ESA_VHD_BLOB}"
+create_managed_image "cisco-sma-image" "${SMA_VHD_BLOB}"
+
+# imports are done - lock the storage account back down NOW
+close_firewall
+trap - EXIT
+
+#-------------------------------------------------------------------------------
+# STEP 3: create the Azure Compute Gallery
+#-------------------------------------------------------------------------------
+echo
+echo "==> Creating Azure Compute Gallery '${GALLERY_NAME}'..."
+az sig create \
+  --resource-group "${RG}" \
+  --gallery-name "${GALLERY_NAME}" \
+  --location "${LOCATION}" -o none
+
+#-------------------------------------------------------------------------------
+# STEP 4 + 5: image definition + image version per appliance
+#-------------------------------------------------------------------------------
+create_gallery_image () {
+  local DEFINITION="$1" SKU="$2" IMAGE_NAME="$3"
+  local T0=$(date +%s)
+
+  echo
+  echo "==> Creating image definition '${DEFINITION}' (Linux / generalized / ${HYPERV_GEN})..."
+  az sig image-definition create \
+    --resource-group "${RG}" \
+    --gallery-name "${GALLERY_NAME}" \
+    --gallery-image-definition "${DEFINITION}" \
+    --publisher Cisco \
+    --offer SecureEmail \
+    --sku "${SKU}" \
+    --os-type Linux \
+    --os-state generalized \
+    --hyper-v-generation "${HYPERV_GEN}" -o none
+
+  echo "==> Creating image version ${IMAGE_VERSION} from managed image '${IMAGE_NAME}'"
+  echo "    (platform-internal copy + replication; no storage endpoints involved)..."
+  az sig image-version create \
+    --resource-group "${RG}" \
+    --gallery-name "${GALLERY_NAME}" \
+    --gallery-image-definition "${DEFINITION}" \
+    --gallery-image-version "${IMAGE_VERSION}" \
+    --managed-image "$(az image show -g "${RG}" -n "${IMAGE_NAME}" --query id -o tsv)" \
+    --target-regions "${LOCATION}=1" \
+    --replica-count 1 -o none
+
+  echo "==> Gallery image '${DEFINITION}/${IMAGE_VERSION}' ready in $(elapsed $(( $(date +%s) - T0 )))"
+}
+
+create_gallery_image "esa-c600v" "C600V" "cisco-esa-image"
+# NOTE: the SMA image OS disk is ~1.5 TB. Validate this version builds cleanly
+# before deleting anything; if the gallery rejects the size, deploy the SMA
+# from the managed image 'cisco-sma-image' instead (identical result, no
+# gallery versioning).
+create_gallery_image "sma-m600v" "M600V" "cisco-sma-image"
+
+#-------------------------------------------------------------------------------
+# STEP 6: deploy VMs from the gallery into the existing VNet
+#-------------------------------------------------------------------------------
+SUBNET_ID=$(az network vnet subnet show \
+  -g "${VNET_RG}" --vnet-name "${VNET_NAME}" -n "${SUBNET_NAME}" --query id -o tsv)
+
+deploy_vm () {
+  local VM_NAME="$1" DEFINITION="$2"
+  local NIC_NAME="${VM_NAME}-mgmt-nic"
+  local IMAGE_ID="/subscriptions/${SUB_ID}/resourceGroups/${RG}/providers/Microsoft.Compute/galleries/${GALLERY_NAME}/images/${DEFINITION}/versions/${IMAGE_VERSION}"
+  local T0=$(date +%s)
+
+  echo
+  echo "==> Creating NIC '${NIC_NAME}' in existing subnet..."
+  local NSG_ARG=()
+  [[ -n "${NSG_NAME}" ]] && NSG_ARG=(--network-security-group \
+    "$(az network nsg show -g "${VNET_RG}" -n "${NSG_NAME}" --query id -o tsv)")
+  az network nic create -g "${RG}" -n "${NIC_NAME}" --subnet "${SUBNET_ID}" \
+    "${NSG_ARG[@]}" -o none
+  # Extra Data1/Data2 NICs must be created here and added to --nics BEFORE
+  # first boot; AsyncOS won't detect NICs attached later.
+
+  echo "==> Deploying '${VM_NAME}' (${VM_SIZE}) from ${DEFINITION}/${IMAGE_VERSION}..."
+  az vm create \
+    --resource-group "${RG}" \
+    --name "${VM_NAME}" \
+    --image "${IMAGE_ID}" \
+    --size "${VM_SIZE}" \
+    --admin-username "${DUMMY_USER}" \
+    --admin-password "${DUMMY_PASS}" \
+    --nics "${NIC_NAME}" \
+    --public-ip-address "" -o none
+
+  if [[ "${HYPERV_GEN}" == "V2" ]]; then
+    echo "==> Gen2 first-boot workaround: restarting '${VM_NAME}' once..."
+    az vm restart -g "${RG}" -n "${VM_NAME}" -o none
+  fi
+
+  echo "==> '${VM_NAME}' deployed in $(elapsed $(( $(date +%s) - T0 ))). Private IP:"
+  az vm show -d -g "${RG}" -n "${VM_NAME}" --query privateIps -o tsv
+}
+
+deploy_vm "${ESA_VM_NAME}" "esa-c600v"
+deploy_vm "${SMA_VM_NAME}" "sma-m600v"
+
+#-------------------------------------------------------------------------------
+# Summary
+#-------------------------------------------------------------------------------
+TOTAL=$(( $(date +%s) - SCRIPT_START ))
+echo
+echo "================================================================"
+echo "==> Total elapsed time: $(elapsed ${TOTAL})"
+echo "==> Storage account public access: Disabled (private endpoint only)"
+echo "==> Appliance login: admin / ironport  (dummy VM creds are ignored)"
+echo "==> Optional cleanup once gallery versions show 'Succeeded':"
+echo "      az image delete -g ${RG} -n cisco-esa-image"
+echo "      az image delete -g ${RG} -n cisco-sma-image"
+echo "      az storage blob delete ... (the source VHDs)"
+echo "================================================================"
