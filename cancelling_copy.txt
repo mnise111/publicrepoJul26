@@ -1,0 +1,22 @@
+DEST_SA=myprivateblobsa11
+DEST_CONTAINER=copied
+DEST_BLOB=bigfile.bin
+
+# 1. Get the copy ID (and check status while you're at it)
+az storage blob show \
+  --account-name $DEST_SA -c $DEST_CONTAINER -n $DEST_BLOB \
+  --auth-mode login \
+  --query "{copyId:properties.copy.id, status:properties.copy.status, progress:properties.copy.progress}" \
+  -o table
+
+COPY_ID=$(az storage blob show \
+  --account-name $DEST_SA -c $DEST_CONTAINER -n $DEST_BLOB \
+  --auth-mode login --query properties.copy.id -o tsv)
+
+# 2. Abort it
+az storage blob copy cancel \
+  --account-name $DEST_SA \
+  --destination-container $DEST_CONTAINER \
+  --destination-blob $DEST_BLOB \
+  --copy-id "$COPY_ID" \
+  --auth-mode login
